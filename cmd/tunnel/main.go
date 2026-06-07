@@ -3,11 +3,13 @@ package main
 import (
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -32,6 +34,7 @@ type Config struct {
 	TLS     TLSConfig     `yaml:"tls"`
 	Token   string        `yaml:"token"`
 	Path    string        `yaml:"path"`
+	Paths   []string      `yaml:"paths"`  // 多路径支持，优先级高于 path
 	Proxies []ProxyConfig `yaml:"proxies"` // 正向代理
 
 	// 客户端配置
@@ -54,10 +57,11 @@ type ProxyConfig struct {
 }
 
 type ServerDef struct {
-	Name     string `yaml:"name"`
-	URL      string `yaml:"url"`
-	Token    string `yaml:"token"`
-	Insecure bool   `yaml:"insecure"`
+	Name     string   `yaml:"name"`
+	URL      string   `yaml:"url"`
+	URLs     []string `yaml:"urls"`  // 多路径支持，优先级高于 url
+	Token    string   `yaml:"token"`
+	Insecure bool     `yaml:"insecure"`
 }
 
 type TunnelDef struct {
@@ -71,6 +75,54 @@ type ExposeDef struct {
 	Backend    string `yaml:"backend"`
 	RemotePort int    `yaml:"remote_port"` // 让服务端监听的端口
 	Server     string `yaml:"server"`
+}
+
+// ================================================================
+// HTTP 头名称（伪装成普通业务头）
+// ================================================================
+
+const (
+	hAuth        = "X-Api-Key"       // 原 Authorization: Bearer
+	hConnType    = "X-Request-Type"  // 原 X-Tunnel-Type
+	hProxyName   = "X-Request-Id"    // 原 X-Proxy-Name
+	hExposeName  = "X-Client-Id"     // 原 X-Expose-Name
+	hRemotePort  = "X-Forward-Port"  // 原 X-Remote-Port
+	hSessionID   = "X-Trace-Id"      // 原 X-Session-ID
+
+	connTypeReverseControl = "rc"  // 原 "reverse-control"
+	connTypeReverseData    = "rd"  // 原 "reverse-data"
+)
+
+// ================================================================
+// WebSocket 帧混淆：发送时附加随机 padding，接收时去除
+// 帧格式：[2字节 padding长度][原始数据][padding]
+// ================================================================
+
+const maxPadding = 64
+
+func encodeFrame(data []byte) []byte {
+	padLen, _ := rand.Int(rand.Reader, big.NewInt(int64(maxPadding+1)))
+	pl := int(padLen.Int64())
+	pad := make([]byte, pl)
+	rand.Read(pad)
+
+	out := make([]byte, 2+len(data)+pl)
+	binary.BigEndian.PutUint16(out[:2], uint16(pl))
+	copy(out[2:], data)
+	copy(out[2+len(data):], pad)
+	return out
+}
+
+func decodeFrame(data []byte) ([]byte, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("frame too short")
+	}
+	pl := int(binary.BigEndian.Uint16(data[:2]))
+	payload := data[2:]
+	if len(payload) < pl {
+		return nil, fmt.Errorf("frame truncated")
+	}
+	return payload[:len(payload)-pl], nil
 }
 
 // ================================================================
@@ -134,8 +186,15 @@ func runServer(cfg *Config) {
 	if cfg.Token == "" {
 		log.Fatal("[server] token must be set")
 	}
-	if cfg.Path == "" {
-		cfg.Path = "/tunnel"
+
+	// 合并 path/paths 为监听路径列表
+	paths := cfg.Paths
+	if len(paths) == 0 {
+		if cfg.Path != "" {
+			paths = []string{cfg.Path}
+		} else {
+			paths = []string{"/tunnel"}
+		}
 	}
 
 	proxyMap := map[string]string{}
@@ -150,24 +209,32 @@ func runServer(cfg *Config) {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc(cfg.Path, func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer "+cfg.Token {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(hAuth) != cfg.Token {
+			// 返回 404 而不是 401，避免暴露服务存在
+			http.NotFound(w, r)
 			return
 		}
-		connType := r.Header.Get("X-Tunnel-Type")
+		connType := r.Header.Get(hConnType)
 		switch connType {
-		case "reverse-control":
+		case connTypeReverseControl:
 			serverHandleReverseControl(w, r)
-		case "reverse-data":
+		case connTypeReverseData:
 			serverHandleReverseData(w, r)
 		default:
 			serverHandleWS(w, r, proxyMap)
 		}
-	})
+	}
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("OK"))
+	for _, p := range paths {
+		mux.HandleFunc(p, handler)
+		log.Printf("[server] registered path: %s", p)
+	}
+
+	// 健康检查返回正常页面，不暴露服务特征
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html><body>OK</body></html>"))
 	})
 
 	srv := &http.Server{Addr: cfg.Listen, Handler: mux}
@@ -178,12 +245,12 @@ func runServer(cfg *Config) {
 			log.Fatalf("[server] TLS config error: %v", err)
 		}
 		srv.TLSConfig = tlsCfg
-		log.Printf("[server] starting (TLS) on %s  path=%s", cfg.Listen, cfg.Path)
+		log.Printf("[server] starting (TLS) on %s  paths=%v", cfg.Listen, paths)
 		if err := srv.ListenAndServeTLS("", ""); err != nil {
 			log.Fatal(err)
 		}
 	} else {
-		log.Printf("[server] starting (HTTP) on %s  path=%s", cfg.Listen, cfg.Path)
+		log.Printf("[server] starting (HTTP) on %s  paths=%v", cfg.Listen, paths)
 		if err := srv.ListenAndServe(); err != nil {
 			log.Fatal(err)
 		}
@@ -192,16 +259,16 @@ func runServer(cfg *Config) {
 
 // serverHandleReverseControl：处理客户端的控制连接，动态监听端口
 func serverHandleReverseControl(w http.ResponseWriter, r *http.Request) {
-	exposeName := r.Header.Get("X-Expose-Name")
-	remotePortStr := r.Header.Get("X-Remote-Port")
+	exposeName := r.Header.Get(hExposeName)
+	remotePortStr := r.Header.Get(hRemotePort)
 	if exposeName == "" || remotePortStr == "" {
-		http.Error(w, "Missing X-Expose-Name or X-Remote-Port", http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
 
 	remotePort, err := strconv.Atoi(remotePortStr)
 	if err != nil || remotePort <= 0 || remotePort > 65535 {
-		http.Error(w, "Invalid X-Remote-Port", http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
 
@@ -230,7 +297,6 @@ func serverHandleReverseControl(w http.ResponseWriter, r *http.Request) {
 	reverseRegistry.Store(exposeName, rc)
 	log.Printf("[server] reverse client registered: [%s] listening on %s", exposeName, listenAddr)
 
-	// 启动监听 goroutine
 	go serverListenReverse(exposeName, ln)
 
 	defer func() {
@@ -253,7 +319,7 @@ func serverListenReverse(name string, ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			return // listener 关闭
+			return
 		}
 		go serverHandleReverseConn(conn, name)
 	}
@@ -287,9 +353,9 @@ func serverHandleReverseConn(extConn net.Conn, name string) {
 }
 
 func serverHandleReverseData(w http.ResponseWriter, r *http.Request) {
-	sid := r.Header.Get("X-Session-ID")
+	sid := r.Header.Get(hSessionID)
 	if sid == "" {
-		http.Error(w, "Missing X-Session-ID", http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
 
@@ -313,14 +379,14 @@ func serverHandleReverseData(w http.ResponseWriter, r *http.Request) {
 
 // serverHandleWS：正向代理，支持 @name 指向反向代理
 func serverHandleWS(w http.ResponseWriter, r *http.Request, proxyMap map[string]string) {
-	proxyName := r.Header.Get("X-Proxy-Name")
+	proxyName := r.Header.Get(hProxyName)
 	if proxyName == "" {
-		http.Error(w, "Missing X-Proxy-Name", http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
 	backend, ok := proxyMap[proxyName]
 	if !ok {
-		http.Error(w, "Unknown proxy name", http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
 
@@ -330,19 +396,17 @@ func serverHandleWS(w http.ResponseWriter, r *http.Request, proxyMap map[string]
 		return
 	}
 
-	sid := r.Header.Get("X-Session-ID")
+	sid := r.Header.Get(hSessionID)
 	if sid == "" {
 		sid = newSessionID()
 	}
 
-	// 检查是否指向反向代理
 	if strings.HasPrefix(backend, "@") {
 		reverseName := backend[1:]
 		serverHandleForwardToReverse(ws, sid, proxyName, reverseName)
 		return
 	}
 
-	// 普通正向代理：连接本机 backend
 	backendConn, err := net.DialTimeout("tcp", backend, 10*time.Second)
 	if err != nil {
 		log.Printf("[server] [%s] failed to connect to backend %s: %v", sid, backend, err)
@@ -483,23 +547,25 @@ func clientExposeOnce(exp ExposeDef, server *ServerDef) error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+server.Token)
-	headers.Set("X-Tunnel-Type", "reverse-control")
-	headers.Set("X-Expose-Name", exp.Name)
-	headers.Set("X-Remote-Port", strconv.Itoa(exp.RemotePort))
+	headers.Set(hAuth, server.Token)
+	headers.Set(hConnType, connTypeReverseControl)
+	headers.Set(hExposeName, exp.Name)
+	headers.Set(hRemotePort, strconv.Itoa(exp.RemotePort))
 
-	ws, _, err := dialer.Dial(httpToWS(server.URL), headers)
+	wsURL := pickURL(server)
+	ws, _, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		return fmt.Errorf("control dial failed: %w", err)
 	}
 	defer ws.Close()
 	log.Printf("[client] expose [%s] control connection established, server listening on port %d", exp.Name, exp.RemotePort)
 
-	// 心跳
+	// 心跳：间隔加随机抖动，避免固定心跳特征
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			jitter, _ := rand.Int(rand.Reader, big.NewInt(15))
+			interval := 25*time.Second + time.Duration(jitter.Int64())*time.Second
+			time.Sleep(interval)
 			if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -536,11 +602,12 @@ func clientDialBack(exp ExposeDef, server *ServerDef, sid string) {
 		HandshakeTimeout: 10 * time.Second,
 	}
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+server.Token)
-	headers.Set("X-Tunnel-Type", "reverse-data")
-	headers.Set("X-Session-ID", sid)
+	headers.Set(hAuth, server.Token)
+	headers.Set(hConnType, connTypeReverseData)
+	headers.Set(hSessionID, sid)
 
-	ws, _, err := dialer.Dial(httpToWS(server.URL), headers)
+	wsURL := pickURL(server)
+	ws, _, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		log.Printf("[client] expose [%s] [%s] data dial failed: %v", exp.Name, sid, err)
 		localConn.Close()
@@ -579,11 +646,12 @@ func clientHandleConn(local net.Conn, sid, proxyName string, server *ServerDef) 
 		HandshakeTimeout: 10 * time.Second,
 	}
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+server.Token)
-	headers.Set("X-Session-ID", sid)
-	headers.Set("X-Proxy-Name", proxyName)
+	headers.Set(hAuth, server.Token)
+	headers.Set(hSessionID, sid)
+	headers.Set(hProxyName, proxyName)
 
-	ws, _, err := dialer.Dial(httpToWS(server.URL), headers)
+	wsURL := pickURL(server)
+	ws, _, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		log.Printf("[client] [%s] WebSocket dial failed: %v", sid, err)
 		return
@@ -596,8 +664,17 @@ func clientHandleConn(local net.Conn, sid, proxyName string, server *ServerDef) 
 	log.Printf("[client] [%s] session closed", sid)
 }
 
+// pickURL 从 server.URLs 随机选一个路径，没有则用 server.URL
+func pickURL(server *ServerDef) string {
+	if len(server.URLs) == 0 {
+		return httpToWS(server.URL)
+	}
+	idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(server.URLs))))
+	return httpToWS(server.URLs[idx.Int64()])
+}
+
 // ================================================================
-// wsNetConn：把 WebSocket 包装成 net.Conn
+// wsNetConn：把 WebSocket 包装成 net.Conn，带帧混淆
 // ================================================================
 
 type wsNetConn struct {
@@ -623,14 +700,21 @@ func (c *wsNetConn) Read(b []byte) (int, error) {
 		if msgType != websocket.BinaryMessage {
 			continue
 		}
-		c.readBuf = data
+		// 解码混淆帧
+		decoded, err := decodeFrame(data)
+		if err != nil {
+			return 0, err
+		}
+		c.readBuf = decoded
 	}
 }
 
 func (c *wsNetConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	err := c.ws.WriteMessage(websocket.BinaryMessage, b)
+	// 编码混淆帧
+	framed := encodeFrame(b)
+	err := c.ws.WriteMessage(websocket.BinaryMessage, framed)
 	if err != nil {
 		return 0, err
 	}
@@ -658,7 +742,7 @@ func bridge(a, b net.Conn, sid string) {
 	defer b.Close()
 
 	done := make(chan struct{}, 2)
-	copy := func(dst, src net.Conn) {
+	cp := func(dst, src net.Conn) {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
 		for {
@@ -674,8 +758,8 @@ func bridge(a, b net.Conn, sid string) {
 		}
 	}
 
-	go copy(a, b)
-	go copy(b, a)
+	go cp(a, b)
+	go cp(b, a)
 	<-done
 }
 

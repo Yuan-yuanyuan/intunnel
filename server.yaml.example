@@ -8,22 +8,17 @@ tls:
   cert_file: "server.crt"
   key_file: "server.key"
 
-# 建议用 openssl rand -hex 32 生成
 token: "your-secret-token-change-me"
 
-# 隧道伪装路径
-path: "/api/v1/metrics"
+# 多路径支持：客户端随机选其中一个，流量分散更自然
+paths:
+  - "/api/v2/sync"
+  - "/api/v1/metrics"
+  - "/health/check"
 
-# 正向代理：家里电脑的隧道连进来后，转发到哪里
-# backend 支持两种写法：
-#   1. 直接地址：如 "127.0.0.1:3389"，转发到服务端本机
-#   2. @name 语法：如 "@office-rdp"，转发到已注册的反向代理客户端
 proxies:
   - name: local-rdp
-    backend: "127.0.0.1:3389"   # 服务端本机的 RDP
+    backend: "127.0.0.1:3389"
 
   - name: home-to-office
-    backend: "@office-rdp"   # 指向反向代理，家里电脑通过这个访问公司电脑
-
-# 注意：不再需要 reverse_proxies 配置段
-# 端口由客户端的 remote_port 决定，服务端动态监听
+    backend: "@office-rdp"

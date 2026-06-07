@@ -3,22 +3,23 @@ mode: client
 
 servers:
   - name: cloud
-    url: "https://云服务器IP:8443/api/v1/metrics"
+    # 多路径：与服务端 paths 对应，每次连接随机选一个
+    urls:
+      - "https://云服务器IP:8443/api/v2/sync"
+      - "https://云服务器IP:8443/api/v1/metrics"
+      - "https://云服务器IP:8443/health/check"
     token: "your-secret-token-change-me"
     insecure: true   # 自签证书时改为 true
 
-# 正向隧道：本地端口 -> 服务端的正向代理
-# 适合：家里电脑访问服务端本机服务，或通过 @name 访问公司电脑
+# 正向隧道
 tunnels:
-  - listen: "127.0.0.1:13389"   # 本地监听，mstsc 连这里
+  - listen: "127.0.0.1:13389"
     server: cloud
-    proxy_name: home-to-office   # 对应服务端 proxies.name（backend 为 @office-rdp）
+    proxy_name: home-to-office
 
-# 反向隧道：把本地服务暴露给服务端
-# 适合：公司电脑把自己的 RDP 暴露出去
-# remote_port：让服务端动态监听的端口（客户端决定，无需改服务端配置）
+# 反向隧道
 expose:
-  - name: office-rdp       # 与服务端 proxies.backend 中的 @name 对应
+  - name: office-rdp
     backend: "127.0.0.1:3389"
-    remote_port: 13389     # 服务端会动态监听这个端口
+    remote_port: 13389
     server: cloud
